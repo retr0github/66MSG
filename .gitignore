@@ -1,0 +1,15 @@
+/target/
+/target-chat/
+/target-telegram/
+**/target/
+node_modules/
+data/
+.npm-cache/
+dist/
+.env
+.env.local
+*.log
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

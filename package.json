@@ -1,0 +1,22 @@
+{
+  "name": "66msg",
+  "version": "0.1.0",
+  "private": true,
+  "workspaces": [
+    "apps/desktop"
+  ],
+  "scripts": {
+    "dev": "npm run dev:web",
+    "dev:web": "npm run dev --workspace @66msg/desktop",
+    "dev:server": "cargo run -p msg-server",
+    "dev:windows": "npm run tauri:dev --workspace @66msg/desktop",
+    "build:web": "npm run build --workspace @66msg/desktop",
+    "build:windows": "npm run tauri:build --workspace @66msg/desktop",
+    "build": "npm run build:web && cargo build --workspace",
+    "check": "npm run check --workspace @66msg/desktop && cargo fmt --all --check && cargo clippy --workspace --all-targets -- -D warnings",
+    "format": "cargo fmt --all && npm run format --workspace @66msg/desktop"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}
