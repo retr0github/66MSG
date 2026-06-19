@@ -9,6 +9,7 @@ dist/
 .env
 .env.local
 *.log
+telegram-debug.log
 .idea/
 .vscode/
 .DS_Store
