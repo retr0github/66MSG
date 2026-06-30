@@ -9,6 +9,8 @@
     "dev": "npm run dev:web",
     "dev:web": "npm run dev --workspace @66msg/desktop",
     "dev:server": "cargo run -p msg-server",
+    "dev:livekit": "docker compose -f infra/docker-compose.yml up -d",
+    "stop:livekit": "docker compose -f infra/docker-compose.yml down",
     "dev:windows": "npm run tauri:dev --workspace @66msg/desktop",
     "build:web": "npm run build --workspace @66msg/desktop",
     "build:windows": "npm run tauri:build --workspace @66msg/desktop",

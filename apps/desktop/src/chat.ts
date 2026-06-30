@@ -6,6 +6,7 @@ export interface PrivateMessage {
   readonly sender_id: string;
   readonly recipient_id: string;
   readonly text: string;
+  readonly attachment?: FileAttachment;
   readonly sent_at: string;
 }
 
@@ -13,7 +14,15 @@ export interface PolygonMessage {
   readonly id: string;
   readonly author_id: string;
   readonly text: string;
+  readonly attachment?: FileAttachment;
   readonly sent_at: string;
+}
+
+export interface FileAttachment {
+  readonly id: string;
+  readonly name: string;
+  readonly size: number;
+  readonly content_type: string;
 }
 
 export type ConnectionState = "connecting" | "online" | "offline";
@@ -27,6 +36,7 @@ type ServerEvent =
       readonly polygon_messages: readonly PolygonMessage[];
     }
   | { readonly type: "user_registered"; readonly user: User }
+  | { readonly type: "user_updated"; readonly user: User }
   | { readonly type: "private_message"; readonly message: PrivateMessage }
   | { readonly type: "polygon_message"; readonly message: PolygonMessage }
   | { readonly type: "session_revoked"; readonly session_id: string }
@@ -40,6 +50,9 @@ interface ChatConnection {
   readonly error: string | undefined;
   readonly sendPrivateMessage: (recipientId: string, text: string) => boolean;
   readonly sendPolygonMessage: (text: string) => boolean;
+  readonly updateUserEmoji: (emoji: string) => boolean;
+  readonly sendFile: (conversationId: string, file: File) => Promise<boolean>;
+  readonly syncUser: (user: User) => void;
 }
 
 const reconnectDelayMs = 1_500;
@@ -52,8 +65,7 @@ export function useChat(session: Session): ChatConnection {
   const [polygonMessages, setPolygonMessages] = useState<
     readonly PolygonMessage[]
   >([]);
-  const [connection, setConnection] =
-    useState<ConnectionState>("connecting");
+  const [connection, setConnection] = useState<ConnectionState>("connecting");
   const [error, setError] = useState<string>();
   const [socket, setSocket] = useState<WebSocket>();
 
@@ -89,6 +101,13 @@ export function useChat(session: Session): ChatConnection {
               current.some((user) => user.id === event.user.id)
                 ? current
                 : [...current, event.user],
+            );
+            break;
+          case "user_updated":
+            setUsers((current) =>
+              current.map((user) =>
+                user.id === event.user.id ? event.user : user,
+              ),
             );
             break;
           case "private_message":
@@ -163,6 +182,63 @@ export function useChat(session: Session): ChatConnection {
     [sendEvent],
   );
 
+  const updateUserEmoji = useCallback(
+    (emoji: string) => sendEvent({ type: "update_user_emoji", emoji }),
+    [sendEvent],
+  );
+
+  const sendFile = useCallback(
+    async (conversationId: string, file: File): Promise<boolean> => {
+      if (file.size === 0) {
+        setError("Нельзя отправить пустой файл");
+        return false;
+      }
+      if (file.size > 8 * 1024 * 1024) {
+        setError("Файл должен быть не больше 8 МБ");
+        return false;
+      }
+
+      const query = new URLSearchParams({
+        conversation_id: conversationId,
+        filename: file.name,
+      });
+      try {
+        const response = await fetch(`${apiBaseUrl()}/chat/file?${query}`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${session.token}`,
+            "Content-Type": file.type || "application/octet-stream",
+          },
+          body: file,
+        });
+        if (!response.ok) {
+          const body: unknown = await response.json().catch(() => undefined);
+          throw new Error(
+            isRecord(body) && typeof body.message === "string"
+              ? body.message
+              : "Не удалось отправить файл",
+          );
+        }
+        setError(undefined);
+        return true;
+      } catch (reason) {
+        setError(
+          reason instanceof Error ? reason.message : "Не удалось отправить файл",
+        );
+        return false;
+      }
+    },
+    [session.token],
+  );
+
+  const syncUser = useCallback((user: User) => {
+    setUsers((current) =>
+      current.some((existing) => existing.id === user.id)
+        ? current.map((existing) => (existing.id === user.id ? user : existing))
+        : [...current, user],
+    );
+  }, []);
+
   return {
     users,
     privateMessages,
@@ -171,6 +247,9 @@ export function useChat(session: Session): ChatConnection {
     error,
     sendPrivateMessage,
     sendPolygonMessage,
+    updateUserEmoji,
+    sendFile,
+    syncUser,
   };
 }
 
@@ -228,6 +307,10 @@ function parseServerEvent(value: unknown): ServerEvent | undefined {
       return isUser(parsed.user)
         ? { type: "user_registered", user: parsed.user }
         : undefined;
+    case "user_updated":
+      return isUser(parsed.user)
+        ? { type: "user_updated", user: parsed.user }
+        : undefined;
     case "private_message":
       return isPrivateMessage(parsed.message)
         ? { type: "private_message", message: parsed.message }
@@ -254,6 +337,7 @@ function isUser(value: unknown): value is User {
     isRecord(value) &&
     typeof value.id === "string" &&
     typeof value.username === "string" &&
+    (value.avatar_url === undefined || typeof value.avatar_url === "string") &&
     typeof value.created_at === "string"
   );
 }
@@ -265,6 +349,7 @@ function isPrivateMessage(value: unknown): value is PrivateMessage {
     typeof value.sender_id === "string" &&
     typeof value.recipient_id === "string" &&
     typeof value.text === "string" &&
+    (value.attachment === undefined || isFileAttachment(value.attachment)) &&
     typeof value.sent_at === "string"
   );
 }
@@ -275,7 +360,18 @@ function isPolygonMessage(value: unknown): value is PolygonMessage {
     typeof value.id === "string" &&
     typeof value.author_id === "string" &&
     typeof value.text === "string" &&
+    (value.attachment === undefined || isFileAttachment(value.attachment)) &&
     typeof value.sent_at === "string"
+  );
+}
+
+function isFileAttachment(value: unknown): value is FileAttachment {
+  return (
+    isRecord(value) &&
+    typeof value.id === "string" &&
+    typeof value.name === "string" &&
+    typeof value.size === "number" &&
+    typeof value.content_type === "string"
   );
 }
 

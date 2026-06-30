@@ -20,6 +20,10 @@ pub struct User {
     pub id: Uuid,
     pub username: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub avatar_url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telegram_username: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub telegram_first_name: Option<String>,
@@ -29,11 +33,21 @@ pub struct User {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileAttachment {
+    pub id: Uuid,
+    pub name: String,
+    pub size: usize,
+    pub content_type: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrivateMessage {
     pub id: Uuid,
     pub sender_id: Uuid,
     pub recipient_id: Uuid,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<FileAttachment>,
     pub sent_at: DateTime<Utc>,
 }
 
@@ -42,6 +56,8 @@ pub struct PolygonMessage {
     pub id: Uuid,
     pub author_id: Uuid,
     pub text: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachment: Option<FileAttachment>,
     pub sent_at: DateTime<Utc>,
 }
 
@@ -69,6 +85,7 @@ pub enum TelegramCodePurpose {
     #[default]
     Registration,
     Login,
+    PasswordReset,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,6 +141,13 @@ pub struct TelegramLoginCodeRequest {
     pub username: String,
 }
 
+#[derive(Debug, Deserialize)]
+pub struct PasswordResetRequest {
+    pub username: String,
+    pub code: String,
+    pub password: String,
+}
+
 #[derive(Debug, Serialize)]
 pub struct TelegramLoginCodeResponse {
     pub expires_in_seconds: i64,
@@ -147,6 +171,7 @@ pub struct TelegramRegistrationInfo {
 pub enum ClientEvent {
     SendPrivateMessage { recipient_id: Uuid, text: String },
     SendPolygonMessage { text: String },
+    UpdateUserEmoji { emoji: String },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -159,6 +184,9 @@ pub enum ServerEvent {
         polygon_messages: Vec<PolygonMessage>,
     },
     UserRegistered {
+        user: User,
+    },
+    UserUpdated {
         user: User,
     },
     PrivateMessage {

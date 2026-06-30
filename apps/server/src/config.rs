@@ -16,6 +16,9 @@ pub struct Config {
     telegram_bot_token: Option<String>,
     telegram_bot_username: Option<String>,
     telegram_proxy_url: Option<String>,
+    livekit_url: String,
+    livekit_api_key: String,
+    livekit_api_secret: String,
 }
 
 impl Config {
@@ -50,6 +53,9 @@ impl Config {
             .filter(|value| !value.trim().is_empty())
             .map(|value| value.trim_start_matches('@').to_owned());
         let telegram_proxy_url = optional_nonempty("TELEGRAM_PROXY_URL");
+        let livekit_url = required_value("LIVEKIT_URL")?;
+        let livekit_api_key = required_value("LIVEKIT_API_KEY")?;
+        let livekit_api_secret = required_value("LIVEKIT_API_SECRET")?;
 
         Ok(Self {
             host,
@@ -60,6 +66,9 @@ impl Config {
             telegram_bot_token,
             telegram_bot_username,
             telegram_proxy_url,
+            livekit_url,
+            livekit_api_key,
+            livekit_api_secret,
         })
     }
 
@@ -90,14 +99,38 @@ impl Config {
     pub fn telegram_proxy_url(&self) -> Option<&str> {
         self.telegram_proxy_url.as_deref()
     }
+
+    pub fn livekit_url(&self) -> &str {
+        &self.livekit_url
+    }
+
+    pub fn livekit_api_key(&self) -> &str {
+        &self.livekit_api_key
+    }
+
+    pub fn livekit_api_secret(&self) -> &str {
+        &self.livekit_api_secret
+    }
 }
 
 fn required_secret(key: &'static str) -> Result<String, AppError> {
-    let value = env::var(key).map_err(|_| AppError::MissingConfig { key })?;
+    let value = required_value(key)?;
     if value.len() < 32 {
         return Err(AppError::WeakSecret { key });
     }
     Ok(value)
+}
+
+fn required_value(key: &'static str) -> Result<String, AppError> {
+    env::var(key)
+        .map_err(|_| AppError::MissingConfig { key })
+        .and_then(|value| {
+            if value.trim().is_empty() {
+                Err(AppError::MissingConfig { key })
+            } else {
+                Ok(value)
+            }
+        })
 }
 
 fn optional_nonempty(key: &'static str) -> Option<String> {

@@ -14,23 +14,31 @@ use argon2::{
 };
 use axum::{
     Json, Router,
+    body::Bytes,
     extract::{
-        ConnectInfo, Query, State,
+        ConnectInfo, DefaultBodyLimit, Path as AxumPath, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{Method, StatusCode},
+    http::{
+        HeaderMap, Method, StatusCode,
+        header::{AUTHORIZATION, CONTENT_TYPE},
+    },
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, post, put},
 };
 use chrono::{Duration as ChronoDuration, Utc};
 use hmac::{Hmac, Mac};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
+use livekit_api::access_token::{AccessToken, VideoGrants};
+use livekit_api::services::{ServiceError, TwirpError, TwirpErrorCode, room::RoomClient};
+use livekit_protocol::TrackSource;
 use rand::Rng;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 use tokio::{sync::broadcast, time::sleep};
 use tower_http::{
     cors::{Any, CorsLayer},
+    services::ServeDir,
     trace::{DefaultOnResponse, TraceLayer},
 };
 use tracing::{Level, debug, error, info, warn};
@@ -40,10 +48,11 @@ use crate::{
     config::Config,
     error::AppError,
     models::{
-        AuthResponse, ClientEvent, HealthResponse, PasswordLoginRequest, PolygonMessage,
-        PrivateMessage, ServerEvent, ServiceStatus, StoredData, StoredSession, StoredUser,
-        TelegramCode, TelegramCodePurpose, TelegramLoginCodeRequest, TelegramLoginCodeResponse,
-        TelegramLoginRequest, TelegramRegistrationInfo, TelegramRegistrationRequest, User,
+        AuthResponse, ClientEvent, FileAttachment, HealthResponse, PasswordLoginRequest,
+        PasswordResetRequest, PolygonMessage, PrivateMessage, ServerEvent, ServiceStatus,
+        StoredData, StoredSession, StoredUser, TelegramCode, TelegramCodePurpose,
+        TelegramLoginCodeRequest, TelegramLoginCodeResponse, TelegramLoginRequest,
+        TelegramRegistrationInfo, TelegramRegistrationRequest, User,
     },
 };
 
@@ -54,6 +63,14 @@ const USERNAME_MAX: usize = 24;
 const PASSWORD_MIN: usize = 8;
 const PASSWORD_MAX: usize = 128;
 const MESSAGE_LIMIT: usize = 2_000;
+const AVATAR_SIZE_LIMIT: usize = 5 * 1024 * 1024;
+const FILE_SIZE_LIMIT: usize = 8 * 1024 * 1024;
+const FILE_NAME_LIMIT: usize = 160;
+const USER_EMOJIS: [&str; 42] = [
+    "😀", "😄", "😊", "🥰", "😍", "😂", "😉", "😎", "🥳", "🤩", "😴", "🤔", "🫡", "🤖", "👻", "👽",
+    "💀", "😈", "🐱", "🐶", "🦊", "🐸", "🐼", "🐵", "🦁", "🐯", "🐧", "🦄", "🔥", "✨", "⭐", "⚡",
+    "💜", "❤️", "💙", "💚", "🌈", "🌙", "☀️", "🚀", "🎮", "🎧",
+];
 const TELEGRAM_CODE_TTL_MINUTES: i64 = 5;
 const TELEGRAM_CODE_MAX_ATTEMPTS: u8 = 5;
 const RATE_LIMIT_WINDOW: Duration = Duration::from_mins(5);
@@ -68,6 +85,9 @@ struct AppState {
     telegram_code_secret: Arc<Vec<u8>>,
     telegram_bot_username: Option<String>,
     telegram_bot: Option<TelegramBot>,
+    livekit_url: Arc<String>,
+    livekit_api_key: Arc<String>,
+    livekit_api_secret: Arc<String>,
     registration_attempts: Arc<Mutex<HashMap<IpAddr, VecDeque<Instant>>>>,
     events: broadcast::Sender<ServerEvent>,
 }
@@ -89,6 +109,9 @@ impl AppState {
             telegram_code_secret: Arc::new(config.telegram_code_secret().as_bytes().to_vec()),
             telegram_bot_username: config.telegram_bot_username().map(ToOwned::to_owned),
             telegram_bot,
+            livekit_url: Arc::new(config.livekit_url().to_owned()),
+            livekit_api_key: Arc::new(config.livekit_api_key().to_owned()),
+            livekit_api_secret: Arc::new(config.livekit_api_secret().to_owned()),
             registration_attempts: Arc::new(Mutex::new(HashMap::new())),
             events,
         })
@@ -118,6 +141,20 @@ impl AppState {
         }
         fs::rename(temporary_path, self.data_path.as_ref())
             .map_err(|_| ApiError::internal("Не удалось завершить сохранение данных"))
+    }
+
+    fn avatars_dir(&self) -> PathBuf {
+        self.data_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("avatars")
+    }
+
+    fn files_dir(&self) -> PathBuf {
+        self.data_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join("files")
     }
 
     fn user_for_token(&self, token: &str) -> Result<AuthenticatedUser, ApiError> {
@@ -441,11 +478,50 @@ struct AuthQuery {
     token: String,
 }
 
+#[derive(Deserialize)]
+struct LiveKitTokenRequest {
+    conversation_id: String,
+}
+
+#[derive(Serialize)]
+struct LiveKitTokenResponse {
+    server_url: String,
+    token: String,
+    room_name: String,
+}
+
+#[derive(Deserialize)]
+struct LiveKitParticipantsQuery {
+    conversation_id: String,
+}
+
+#[derive(Serialize)]
+struct LiveKitParticipantsResponse {
+    participants: Vec<LiveKitParticipantResponse>,
+}
+
+#[derive(Serialize)]
+struct LiveKitParticipantResponse {
+    identity: String,
+    name: String,
+    muted: bool,
+}
+
+#[derive(Deserialize)]
+struct FileUploadQuery {
+    conversation_id: String,
+    filename: String,
+}
+
 pub fn build_router(config: &Config) -> Result<Router, AppError> {
     let telegram_bot = config
         .telegram_bot_token()
         .and_then(|token| build_telegram_bot(token, config.telegram_proxy_url()));
     let state = AppState::load(config, telegram_bot.clone())?;
+    let avatars_dir = state.avatars_dir();
+    let files_dir = state.files_dir();
+    fs::create_dir_all(&avatars_dir)?;
+    fs::create_dir_all(&files_dir)?;
 
     if let Some(bot) = telegram_bot {
         tokio::spawn(run_telegram_bot(state.clone(), bot));
@@ -466,12 +542,24 @@ pub fn build_router(config: &Config) -> Result<Router, AppError> {
             post(request_telegram_login_code),
         )
         .route("/auth/login/telegram-code", post(login_with_telegram_code))
+        .route(
+            "/auth/password-reset/request",
+            post(request_password_reset_code),
+        )
+        .route("/auth/password-reset", post(reset_password))
+        .route("/livekit/token", post(livekit_token))
+        .route("/livekit/participants", get(livekit_participants))
+        .route("/chat/file", post(upload_chat_file))
+        .route("/chat/file/{file_id}", get(download_chat_file))
+        .route("/profile/avatar", put(upload_avatar).delete(delete_avatar))
         .route("/ws", get(websocket))
+        .nest_service("/avatars", ServeDir::new(avatars_dir))
         .with_state(state)
+        .layer(DefaultBodyLimit::max(FILE_SIZE_LIMIT))
         .layer(
             CorsLayer::new()
                 .allow_origin(Any)
-                .allow_methods([Method::GET, Method::POST])
+                .allow_methods([Method::GET, Method::POST, Method::PUT, Method::DELETE])
                 .allow_headers(Any),
         )
         .layer(
@@ -507,6 +595,381 @@ async fn telegram_registration_info(
         bot_url,
         code_ttl_seconds: TELEGRAM_CODE_TTL_MINUTES * 60,
     })
+}
+
+async fn livekit_token(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(request): Json<LiveKitTokenRequest>,
+) -> Result<Json<LiveKitTokenResponse>, ApiError> {
+    let session_token = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("Требуется авторизация"))?;
+    let authenticated = state.user_for_token(session_token)?;
+
+    let room_name = voice_room_name(&state, authenticated.user.id, &request.conversation_id)?;
+
+    let grants = VideoGrants {
+        room_join: true,
+        room: room_name.clone(),
+        can_publish: true,
+        can_subscribe: true,
+        can_publish_data: false,
+        can_publish_sources: vec![
+            "camera".to_owned(),
+            "microphone".to_owned(),
+            "screen_share".to_owned(),
+            "screen_share_audio".to_owned(),
+        ],
+        ..VideoGrants::default()
+    };
+    let token = AccessToken::with_api_key(&state.livekit_api_key, &state.livekit_api_secret)
+        .with_identity(&authenticated.user.id.to_string())
+        .with_name(&authenticated.user.username)
+        .with_ttl(Duration::from_hours(1))
+        .with_grants(grants)
+        .to_jwt()
+        .map_err(|_| ApiError::internal("Не удалось создать токен голосового чата"))?;
+
+    Ok(Json(LiveKitTokenResponse {
+        server_url: state.livekit_url.as_ref().clone(),
+        token,
+        room_name,
+    }))
+}
+
+async fn livekit_participants(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<LiveKitParticipantsQuery>,
+) -> Result<Json<LiveKitParticipantsResponse>, ApiError> {
+    let authenticated = authenticated_from_headers(&state, &headers)?;
+    let room_name = voice_room_name(&state, authenticated.user.id, &query.conversation_id)?;
+    let host = state
+        .livekit_url
+        .replace("ws://", "http://")
+        .replace("wss://", "https://");
+    let client = RoomClient::with_api_key(&host, &state.livekit_api_key, &state.livekit_api_secret);
+    let participants = match client.list_participants(&room_name).await {
+        Ok(participants) => participants,
+        Err(ServiceError::Twirp(TwirpError::Twirp(error)))
+            if error.code == TwirpErrorCode::NOT_FOUND =>
+        {
+            Vec::new()
+        }
+        Err(error) => {
+            warn!(%error, room = %room_name, "failed to list LiveKit participants");
+            return Err(ApiError::internal(
+                "Не удалось получить участников голосового чата",
+            ));
+        }
+    };
+
+    Ok(Json(LiveKitParticipantsResponse {
+        participants: participants
+            .into_iter()
+            .map(|participant| {
+                let microphone = participant
+                    .tracks
+                    .iter()
+                    .find(|track| track.source == TrackSource::Microphone as i32);
+                LiveKitParticipantResponse {
+                    identity: participant.identity,
+                    name: participant.name,
+                    muted: microphone.is_none_or(|track| track.muted),
+                }
+            })
+            .collect(),
+    }))
+}
+
+fn voice_room_name(
+    state: &AppState,
+    user_id: Uuid,
+    conversation_id: &str,
+) -> Result<String, ApiError> {
+    if conversation_id == "polygon" {
+        return Ok("66polygon".to_owned());
+    }
+
+    let peer_id = Uuid::parse_str(conversation_id)
+        .map_err(|_| ApiError::bad_request("Некорректный голосовой чат"))?;
+    if peer_id == user_id {
+        return Err(ApiError::bad_request("Нельзя начать звонок самому себе"));
+    }
+    if !state
+        .data()?
+        .users
+        .iter()
+        .any(|stored| stored.user.id == peer_id)
+    {
+        return Err(ApiError::bad_request("Пользователь не найден"));
+    }
+
+    let mut participant_ids = [user_id, peer_id];
+    participant_ids.sort_unstable();
+    Ok(format!(
+        "private-{}-{}",
+        participant_ids[0], participant_ids[1]
+    ))
+}
+
+async fn upload_avatar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Result<Json<User>, ApiError> {
+    let authenticated = authenticated_from_headers(&state, &headers)?;
+    if body.is_empty() {
+        return Err(ApiError::bad_request("Выберите изображение"));
+    }
+    if body.len() > AVATAR_SIZE_LIMIT {
+        return Err(ApiError::bad_request("Аватар должен быть не больше 5 МБ"));
+    }
+
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or_default();
+    let extension = avatar_extension(content_type, &body)
+        .ok_or_else(|| ApiError::bad_request("Поддерживаются JPEG, PNG, WebP и GIF"))?;
+    let avatars_dir = state.avatars_dir();
+    fs::create_dir_all(&avatars_dir)
+        .map_err(|_| ApiError::internal("Не удалось создать папку аватаров"))?;
+    remove_user_avatar_files(&avatars_dir, authenticated.user.id);
+
+    let filename = format!("{}.{}", authenticated.user.id, extension);
+    let final_path = avatars_dir.join(&filename);
+    let temporary_path = avatars_dir.join(format!("{filename}.tmp"));
+    fs::write(&temporary_path, &body)
+        .map_err(|_| ApiError::internal("Не удалось сохранить аватар"))?;
+    fs::rename(&temporary_path, &final_path)
+        .map_err(|_| ApiError::internal("Не удалось завершить сохранение аватара"))?;
+
+    let avatar_url = format!("/avatars/{filename}?v={}", Utc::now().timestamp_millis());
+    let user = update_user_avatar(&state, authenticated.user.id, Some(avatar_url))?;
+    let _receiver_count = state
+        .events
+        .send(ServerEvent::UserUpdated { user: user.clone() });
+    Ok(Json(user))
+}
+
+async fn delete_avatar(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<User>, ApiError> {
+    let authenticated = authenticated_from_headers(&state, &headers)?;
+    remove_user_avatar_files(&state.avatars_dir(), authenticated.user.id);
+    let user = update_user_avatar(&state, authenticated.user.id, None)?;
+    let _receiver_count = state
+        .events
+        .send(ServerEvent::UserUpdated { user: user.clone() });
+    Ok(Json(user))
+}
+
+async fn upload_chat_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<FileUploadQuery>,
+    body: Bytes,
+) -> Result<StatusCode, ApiError> {
+    let authenticated = authenticated_from_headers(&state, &headers)?;
+    if body.is_empty() {
+        return Err(ApiError::bad_request("Выберите непустой файл"));
+    }
+    if body.len() > FILE_SIZE_LIMIT {
+        return Err(ApiError::bad_request("Файл должен быть не больше 8 МБ"));
+    }
+    let filename = validated_file_name(&query.filename)?;
+    let content_type = headers
+        .get(CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("application/octet-stream")
+        .to_owned();
+    let attachment = FileAttachment {
+        id: Uuid::new_v4(),
+        name: filename,
+        size: body.len(),
+        content_type,
+    };
+    let path = state.files_dir().join(attachment.id.to_string());
+    fs::write(&path, &body).map_err(|_| ApiError::internal("Не удалось сохранить файл"))?;
+
+    let result = if query.conversation_id == "polygon" {
+        let message = PolygonMessage {
+            id: Uuid::new_v4(),
+            author_id: authenticated.user.id,
+            text: String::new(),
+            attachment: Some(attachment),
+            sent_at: Utc::now(),
+        };
+        let result = (|| -> Result<(), ApiError> {
+            let mut data = state.data()?;
+            let mut updated = data.clone();
+            updated.polygon_messages.push(message.clone());
+            state.persist(&updated)?;
+            *data = updated;
+            Ok(())
+        })();
+        result.map(|()| {
+            let _receiver_count = state.events.send(ServerEvent::PolygonMessage { message });
+        })
+    } else {
+        let recipient_id = Uuid::parse_str(&query.conversation_id)
+            .map_err(|_| ApiError::bad_request("Некорректный получатель"))?;
+        if recipient_id == authenticated.user.id {
+            let _result = fs::remove_file(&path);
+            return Err(ApiError::bad_request("Нельзя отправить файл самому себе"));
+        }
+        let message = PrivateMessage {
+            id: Uuid::new_v4(),
+            sender_id: authenticated.user.id,
+            recipient_id,
+            text: String::new(),
+            attachment: Some(attachment),
+            sent_at: Utc::now(),
+        };
+        let result = (|| -> Result<(), ApiError> {
+            let mut data = state.data()?;
+            if !data
+                .users
+                .iter()
+                .any(|stored| stored.user.id == recipient_id)
+            {
+                return Err(ApiError::bad_request("Получатель не найден"));
+            }
+            let mut updated = data.clone();
+            updated.messages.push(message.clone());
+            state.persist(&updated)?;
+            *data = updated;
+            Ok(())
+        })();
+        result.map(|()| {
+            let _receiver_count = state.events.send(ServerEvent::PrivateMessage { message });
+        })
+    };
+
+    if let Err(error) = result {
+        let _result = fs::remove_file(path);
+        return Err(error);
+    }
+    Ok(StatusCode::CREATED)
+}
+
+async fn download_chat_file(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    AxumPath(file_id): AxumPath<Uuid>,
+) -> Result<Response, ApiError> {
+    let authenticated = authenticated_from_headers(&state, &headers)?;
+    let _attachment = {
+        let data = state.data()?;
+        data.messages
+            .iter()
+            .find(|message| {
+                (message.sender_id == authenticated.user.id
+                    || message.recipient_id == authenticated.user.id)
+                    && message
+                        .attachment
+                        .as_ref()
+                        .is_some_and(|attachment| attachment.id == file_id)
+            })
+            .and_then(|message| message.attachment.clone())
+            .or_else(|| {
+                data.polygon_messages
+                    .iter()
+                    .find(|message| {
+                        message
+                            .attachment
+                            .as_ref()
+                            .is_some_and(|attachment| attachment.id == file_id)
+                    })
+                    .and_then(|message| message.attachment.clone())
+            })
+            .ok_or_else(|| ApiError::new(StatusCode::NOT_FOUND, "NOT_FOUND", "Файл не найден"))?
+    };
+    let bytes = fs::read(state.files_dir().join(file_id.to_string()))
+        .map_err(|_| ApiError::new(StatusCode::NOT_FOUND, "NOT_FOUND", "Файл не найден"))?;
+    Ok((
+        [
+            ("content-type", "application/octet-stream"),
+            ("x-content-type-options", "nosniff"),
+            ("content-disposition", "attachment"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+fn validated_file_name(value: &str) -> Result<String, ApiError> {
+    let name = value
+        .replace('\\', "/")
+        .rsplit('/')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+    let length = name.chars().count();
+    if length == 0 || length > FILE_NAME_LIMIT || name.chars().any(char::is_control) {
+        return Err(ApiError::bad_request(
+            "Имя файла должно содержать от 1 до 160 символов",
+        ));
+    }
+    Ok(name)
+}
+
+fn authenticated_from_headers(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<AuthenticatedUser, ApiError> {
+    let token = headers
+        .get(AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .ok_or_else(|| ApiError::unauthorized("Требуется авторизация"))?;
+    state.user_for_token(token)
+}
+
+fn avatar_extension(content_type: &str, body: &[u8]) -> Option<&'static str> {
+    match content_type.split(';').next().unwrap_or_default().trim() {
+        "image/jpeg" if body.starts_with(&[0xff, 0xd8, 0xff]) => Some("jpg"),
+        "image/png" if body.starts_with(b"\x89PNG\r\n\x1a\n") => Some("png"),
+        "image/gif" if body.starts_with(b"GIF87a") || body.starts_with(b"GIF89a") => Some("gif"),
+        "image/webp"
+            if body.len() >= 12 && body.starts_with(b"RIFF") && &body[8..12] == b"WEBP" =>
+        {
+            Some("webp")
+        }
+        _ => None,
+    }
+}
+
+fn remove_user_avatar_files(directory: &std::path::Path, user_id: Uuid) {
+    for extension in ["jpg", "png", "gif", "webp"] {
+        let _result = fs::remove_file(directory.join(format!("{user_id}.{extension}")));
+    }
+}
+
+fn update_user_avatar(
+    state: &AppState,
+    user_id: Uuid,
+    avatar_url: Option<String>,
+) -> Result<User, ApiError> {
+    let mut data = state.data()?;
+    let mut updated = data.clone();
+    let stored = updated
+        .users
+        .iter_mut()
+        .find(|stored| stored.user.id == user_id)
+        .ok_or_else(|| ApiError::bad_request("Пользователь не найден"))?;
+    stored.user.avatar_url = avatar_url;
+    let user = stored.user.clone();
+    state.persist(&updated)?;
+    *data = updated;
+    Ok(user)
 }
 
 async fn register_with_telegram_code(
@@ -583,6 +1046,8 @@ async fn register_with_telegram_code(
         let user = User {
             id: Uuid::new_v4(),
             username,
+            emoji: None,
+            avatar_url: None,
             telegram_username,
             telegram_first_name: first_name,
             telegram_last_name: last_name,
@@ -752,6 +1217,140 @@ async fn login_with_telegram_code(
     Ok(Json(AuthResponse { token, user }))
 }
 
+async fn request_password_reset_code(
+    State(state): State<AppState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Json(request): Json<TelegramLoginCodeRequest>,
+) -> Result<Json<TelegramLoginCodeResponse>, ApiError> {
+    state.check_registration_rate(address.ip())?;
+    let stored = state
+        .data()?
+        .users
+        .iter()
+        .find(|item| {
+            item.user
+                .username
+                .eq_ignore_ascii_case(request.username.trim())
+        })
+        .cloned()
+        .ok_or_else(ApiError::telegram_not_registered)?;
+    let telegram_id = stored
+        .telegram_id
+        .ok_or_else(ApiError::telegram_not_registered)?;
+    let bot = state
+        .telegram_bot
+        .clone()
+        .ok_or_else(ApiError::telegram_unavailable)?;
+    let telegram_user = TelegramUser {
+        id: telegram_id,
+        first_name: stored
+            .user
+            .telegram_first_name
+            .clone()
+            .unwrap_or_else(|| stored.user.username.clone()),
+        last_name: stored.user.telegram_last_name.clone(),
+        username: stored.user.telegram_username.clone(),
+    };
+    let code = state.issue_telegram_code(&telegram_user, TelegramCodePurpose::PasswordReset)?;
+    if let Err(error) = bot
+        .send_text(
+            telegram_id,
+            &format!(
+                "Код для смены пароля 66MSG: {code}. Он действует {TELEGRAM_CODE_TTL_MINUTES} минут. Если вы не запрашивали смену пароля, никому не сообщайте этот код."
+            ),
+        )
+        .await
+    {
+        invalidate_latest_code(
+            &state,
+            telegram_id,
+            TelegramCodePurpose::PasswordReset,
+        )?;
+        return Err(error);
+    }
+    Ok(Json(TelegramLoginCodeResponse {
+        expires_in_seconds: TELEGRAM_CODE_TTL_MINUTES * 60,
+    }))
+}
+
+async fn reset_password(
+    State(state): State<AppState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Json(request): Json<PasswordResetRequest>,
+) -> Result<StatusCode, ApiError> {
+    state.check_registration_rate(address.ip())?;
+    let username = request.username.trim();
+    let code = request.code.trim();
+    if code.len() != 6 || !code.bytes().all(|byte| byte.is_ascii_digit()) {
+        return Err(ApiError::invalid_code());
+    }
+    validate_password(&request.password)?;
+    let password_hash = hash_password(&request.password)?;
+    let now = Utc::now();
+
+    let mut data = state.data()?;
+    let mut updated = data.clone();
+    let user_index = updated
+        .users
+        .iter()
+        .position(|item| item.user.username.eq_ignore_ascii_case(username))
+        .ok_or_else(ApiError::invalid_code)?;
+    let telegram_id = updated.users[user_index]
+        .telegram_id
+        .ok_or_else(ApiError::invalid_code)?;
+    let user_id = updated.users[user_index].user.id;
+    let Some(code_index) = updated.telegram_codes.iter().rposition(|item| {
+        item.telegram_id == telegram_id
+            && item.purpose == TelegramCodePurpose::PasswordReset
+            && item.used_at.is_none()
+    }) else {
+        return Err(ApiError::invalid_code());
+    };
+
+    let reset_code = &mut updated.telegram_codes[code_index];
+    if reset_code.attempts >= TELEGRAM_CODE_MAX_ATTEMPTS {
+        return Err(ApiError::too_many_attempts());
+    }
+    if reset_code.expires_at <= now {
+        return Err(ApiError::code_expired());
+    }
+    let expected_payload = format!("{code}:{telegram_id}");
+    if !verify_hmac_hex(
+        &state.telegram_code_secret,
+        expected_payload.as_bytes(),
+        &reset_code.code_hash,
+    ) {
+        reset_code.attempts = reset_code.attempts.saturating_add(1);
+        state.persist(&updated)?;
+        *data = updated;
+        return Err(ApiError::invalid_code());
+    }
+
+    reset_code.used_at = Some(now);
+    updated.users[user_index].password_hash = Some(password_hash);
+    let revoked_session_ids = updated
+        .sessions
+        .iter_mut()
+        .filter_map(|session| {
+            if session.user_id == user_id && session.revoked_at.is_none() {
+                session.revoked_at = Some(now);
+                Some(session.id)
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    state.persist(&updated)?;
+    *data = updated;
+    drop(data);
+    for session_id in revoked_session_ids {
+        let _receiver_count = state
+            .events
+            .send(ServerEvent::SessionRevoked { session_id });
+    }
+    Ok(StatusCode::NO_CONTENT)
+}
+
 async fn websocket(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
@@ -882,6 +1481,7 @@ fn process_client_message(state: &AppState, sender_id: Uuid, payload: &str) -> O
                 sender_id,
                 recipient_id,
                 text,
+                attachment: None,
                 sent_at: Utc::now(),
             };
             let result = (|| -> Result<(), ApiError> {
@@ -916,6 +1516,7 @@ fn process_client_message(state: &AppState, sender_id: Uuid, payload: &str) -> O
                 id: Uuid::new_v4(),
                 author_id: sender_id,
                 text,
+                attachment: None,
                 sent_at: Utc::now(),
             };
             let result = (|| -> Result<(), ApiError> {
@@ -934,7 +1535,41 @@ fn process_client_message(state: &AppState, sender_id: Uuid, payload: &str) -> O
             let _receiver_count = state.events.send(ServerEvent::PolygonMessage { message });
             None
         }
+        ClientEvent::UpdateUserEmoji { emoji } => {
+            let user = match update_user_emoji(state, sender_id, &emoji) {
+                Ok(user) => user,
+                Err(message) => return Some(ServerEvent::Error { message }),
+            };
+            let _receiver_count = state.events.send(ServerEvent::UserUpdated { user });
+            None
+        }
     }
+}
+
+fn update_user_emoji(state: &AppState, user_id: Uuid, value: &str) -> Result<User, String> {
+    let emoji = validated_user_emoji(value)?;
+    let mut data = state.data().map_err(|error| error.message)?;
+    let mut updated = data.clone();
+    let stored = updated
+        .users
+        .iter_mut()
+        .find(|stored| stored.user.id == user_id)
+        .ok_or_else(|| "Пользователь не найден".to_owned())?;
+    stored.user.emoji = emoji;
+    let user = stored.user.clone();
+    state.persist(&updated).map_err(|error| error.message)?;
+    *data = updated;
+    Ok(user)
+}
+
+fn validated_user_emoji(value: &str) -> Result<Option<String>, String> {
+    if value.is_empty() {
+        return Ok(None);
+    }
+    if USER_EMOJIS.contains(&value) {
+        return Ok(Some(value.to_owned()));
+    }
+    Err("Выберите эмодзи из предложенного списка".to_owned())
 }
 
 fn validated_message_text(text: &str) -> Result<String, String> {
@@ -954,6 +1589,7 @@ fn event_is_visible(event: &ServerEvent, user_id: Uuid) -> bool {
         }
         ServerEvent::Ready { .. }
         | ServerEvent::UserRegistered { .. }
+        | ServerEvent::UserUpdated { .. }
         | ServerEvent::PolygonMessage { .. }
         | ServerEvent::Error { .. } => true,
         ServerEvent::SessionRevoked { .. } => false,
@@ -1358,8 +1994,8 @@ mod tests {
     use uuid::Uuid;
 
     use super::{
-        AppState, event_is_visible, hash_password, hmac_hex, validate_password, validate_username,
-        verify_hmac_hex,
+        AppState, avatar_extension, event_is_visible, hash_password, hmac_hex, update_user_emoji,
+        validate_password, validate_username, verify_hmac_hex,
     };
     use crate::models::{ServerEvent, StoredData, StoredUser, User};
 
@@ -1371,6 +2007,24 @@ mod tests {
         let hash = result.unwrap_or_default();
         assert!(verify_hmac_hex(secret, b"123456:42", &hash));
         assert!(!verify_hmac_hex(secret, b"123457:42", &hash));
+    }
+
+    #[test]
+    fn validates_avatar_content_signatures() {
+        assert_eq!(
+            avatar_extension("image/png", b"\x89PNG\r\n\x1a\nimage"),
+            Some("png")
+        );
+        assert_eq!(
+            avatar_extension("image/jpeg", &[0xff, 0xd8, 0xff, 0xe0]),
+            Some("jpg")
+        );
+        assert_eq!(
+            avatar_extension("image/webp", b"RIFFxxxxWEBP"),
+            Some("webp")
+        );
+        assert_eq!(avatar_extension("image/png", b"<svg></svg>"), None);
+        assert_eq!(avatar_extension("image/svg+xml", b"<svg></svg>"), None);
     }
 
     #[test]
@@ -1412,6 +2066,8 @@ mod tests {
         let user = User {
             id: Uuid::new_v4(),
             username: "session_test".to_owned(),
+            emoji: None,
+            avatar_url: None,
             telegram_username: None,
             telegram_first_name: None,
             telegram_last_name: None,
@@ -1432,6 +2088,9 @@ mod tests {
             telegram_code_secret: Arc::new(vec![b'y'; 32]),
             telegram_bot_username: None,
             telegram_bot: None,
+            livekit_url: Arc::new("ws://127.0.0.1:7880".to_owned()),
+            livekit_api_key: Arc::new("devkey".to_owned()),
+            livekit_api_secret: Arc::new("dev-secret-0123456789-66msg-voice".to_owned()),
             registration_attempts: Arc::new(Mutex::new(HashMap::new())),
             events,
         };
@@ -1462,5 +2121,66 @@ mod tests {
             },
             Uuid::new_v4(),
         ));
+    }
+
+    #[test]
+    fn user_emoji_is_persisted_and_can_be_cleared() {
+        let user = User {
+            id: Uuid::new_v4(),
+            username: "emoji_test".to_owned(),
+            emoji: None,
+            avatar_url: None,
+            telegram_username: None,
+            telegram_first_name: None,
+            telegram_last_name: None,
+            created_at: Utc::now(),
+        };
+        let mut data = StoredData::default();
+        data.users.push(StoredUser {
+            user: user.clone(),
+            telegram_id: None,
+            password_hash: None,
+        });
+        let path = std::env::temp_dir().join(format!("66msg-emoji-test-{}.json", Uuid::new_v4()));
+        let (events, _) = broadcast::channel(8);
+        let state = AppState {
+            data: Arc::new(Mutex::new(data)),
+            data_path: Arc::new(path.clone()),
+            jwt_secret: Arc::new(vec![b'x'; 32]),
+            telegram_code_secret: Arc::new(vec![b'y'; 32]),
+            telegram_bot_username: None,
+            telegram_bot: None,
+            livekit_url: Arc::new("ws://127.0.0.1:7880".to_owned()),
+            livekit_api_key: Arc::new("devkey".to_owned()),
+            livekit_api_secret: Arc::new("dev-secret-0123456789-66msg-voice".to_owned()),
+            registration_attempts: Arc::new(Mutex::new(HashMap::new())),
+            events,
+        };
+
+        assert_eq!(
+            update_user_emoji(&state, user.id, "🦊")
+                .ok()
+                .and_then(|updated| updated.emoji),
+            Some("🦊".to_owned())
+        );
+        assert_eq!(
+            update_user_emoji(&state, user.id, "")
+                .ok()
+                .and_then(|updated| updated.emoji),
+            None
+        );
+        assert!(update_user_emoji(&state, user.id, "not-an-emoji").is_err());
+
+        let _result = fs::remove_file(path);
+    }
+
+    #[test]
+    fn accepts_new_user_emoji_options() {
+        for emoji in ["😄", "🫡", "🐼", "❤️", "☀️", "🎧"] {
+            assert_eq!(
+                super::validated_user_emoji(emoji).ok().flatten().as_deref(),
+                Some(emoji)
+            );
+        }
     }
 }

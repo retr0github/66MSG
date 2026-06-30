@@ -1,0 +1,14 @@
+services:
+  livekit:
+    image: livekit/livekit-server:latest
+    command: --config /etc/livekit.yaml --bind 0.0.0.0
+    environment:
+      LIVEKIT_API_KEY: devkey
+      LIVEKIT_API_SECRET: dev-secret-0123456789-66msg-voice
+    volumes:
+      - ./livekit.yaml:/etc/livekit.yaml:ro
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "51000-51100:51000-51100/udp"
+    restart: unless-stopped
