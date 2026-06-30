@@ -31,6 +31,12 @@ type Conversation = "polygon" | string;
 type AuthMode = "register" | "login" | "reset";
 type LoginMethod = "telegram" | "password";
 
+interface DraftPhoto {
+  readonly id: string;
+  readonly file: File;
+  readonly previewUrl: string;
+}
+
 const userEmojiOptions = [
   "😀",
   "😄",
@@ -546,6 +552,8 @@ function Messenger({
   );
   const [conversation, setConversation] = useState<Conversation>("polygon");
   const [draft, setDraft] = useState("");
+  const [photoDrafts, setPhotoDrafts] = useState<readonly DraftPhoto[]>([]);
+  const [photoDraftError, setPhotoDraftError] = useState<string>();
   const [filePending, setFilePending] = useState(false);
   const [avatarPending, setAvatarPending] = useState(false);
   const [avatarError, setAvatarError] = useState<string>();
@@ -555,6 +563,7 @@ function Messenger({
   >([]);
   const [volumeParticipantId, setVolumeParticipantId] = useState<string>();
   const avatarInput = useRef<HTMLInputElement>(null);
+  const photoDraftsRef = useRef<readonly DraftPhoto[]>([]);
   const messagesEnd = useRef<HTMLDivElement>(null);
   const selectedUser =
     conversation === "polygon"
@@ -575,40 +584,111 @@ function Messenger({
     [conversation, polygonMessages, privateMessages, session.user.id],
   );
 
+  const clearPhotoDrafts = () => {
+    photoDraftsRef.current.forEach((photo) =>
+      URL.revokeObjectURL(photo.previewUrl),
+    );
+    photoDraftsRef.current = [];
+    setPhotoDrafts([]);
+  };
+
+  const removePhotoDraft = (id: string) => {
+    setPhotoDrafts((current) => {
+      const removed = current.find((photo) => photo.id === id);
+      if (removed !== undefined) URL.revokeObjectURL(removed.previewUrl);
+      const next = current.filter((photo) => photo.id !== id);
+      photoDraftsRef.current = next;
+      return next;
+    });
+  };
+
+  const addPhotoDrafts = (files: FileList | null) => {
+    const selectedFiles = files === null ? [] : Array.from(files);
+    if (selectedFiles.length === 0) return;
+
+    const accepted: DraftPhoto[] = [];
+    let hasRejectedFile = false;
+
+    selectedFiles.forEach((file) => {
+      if (!file.type.startsWith("image/")) {
+        hasRejectedFile = true;
+        return;
+      }
+      if (file.size === 0 || file.size > 8 * 1024 * 1024) {
+        hasRejectedFile = true;
+        return;
+      }
+      accepted.push(createDraftPhoto(file));
+    });
+
+    if (accepted.length > 0) {
+      setPhotoDrafts((current) => {
+        const next = [...current, ...accepted];
+        photoDraftsRef.current = next;
+        return next;
+      });
+    }
+
+    setPhotoDraftError(
+      hasRejectedFile
+        ? "Можно добавить только изображения до 8 МБ."
+        : undefined,
+    );
+  };
+
   useEffect(() => {
     messagesEnd.current?.scrollIntoView({ behavior: "smooth" });
   }, [visibleMessages]);
 
   useEffect(() => {
     setHiddenScreenShareIds([]);
+    clearPhotoDrafts();
+    setPhotoDraftError(undefined);
   }, [conversation]);
 
-  const submitMessage = (event: FormEvent<HTMLFormElement>) => {
+  useEffect(
+    () => () => {
+      clearPhotoDrafts();
+    },
+    [],
+  );
+
+  const submitMessage = async (event: FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     const text = draft.trim();
-    if (text.length === 0) return;
+    if (text.length === 0 && photoDrafts.length === 0) return;
 
-    const sent =
-      conversation === "polygon"
-        ? sendPolygonMessage(text)
-        : sendPrivateMessage(conversation, text);
-    if (sent) setDraft("");
+    if (text.length > 0) {
+      const sent =
+        conversation === "polygon"
+          ? sendPolygonMessage(text)
+          : sendPrivateMessage(conversation, text);
+      if (!sent) return;
+    }
+
+    if (photoDrafts.length === 0) {
+      setDraft("");
+      return;
+    }
+
+    setFilePending(true);
+    try {
+      for (const photo of photoDrafts) {
+        const sent = await sendFile(conversation, photo.file);
+        if (!sent) return;
+      }
+      setDraft("");
+      setPhotoDraftError(undefined);
+      clearPhotoDrafts();
+    } finally {
+      setFilePending(false);
+    }
   };
 
   const handleComposerKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>) => {
     if (event.key === "Enter" && !event.shiftKey) {
       event.preventDefault();
       event.currentTarget.form?.requestSubmit();
-    }
-  };
-
-  const selectChatFile = async (file: File | undefined) => {
-    if (file === undefined) return;
-    setFilePending(true);
-    try {
-      await sendFile(conversation, file);
-    } finally {
-      setFilePending(false);
     }
   };
 
@@ -1115,6 +1195,25 @@ function Messenger({
         <div className="composer-area">
           <AuthError message={voice.error} />
           <AuthError message={error} />
+          <AuthError message={photoDraftError} />
+          {photoDrafts.length === 0 ? null : (
+            <div className="photo-draft-list" aria-label="Выбранные фото">
+              {photoDrafts.map((photo) => (
+                <article className="photo-draft" key={photo.id}>
+                  <img src={photo.previewUrl} alt={photo.file.name} />
+                  <button
+                    type="button"
+                    aria-label={`Убрать ${photo.file.name}`}
+                    title="Убрать фото"
+                    disabled={filePending}
+                    onClick={() => removePhotoDraft(photo.id)}
+                  >
+                    ×
+                  </button>
+                </article>
+              ))}
+            </div>
+          )}
           <form className="composer" onSubmit={submitMessage}>
             <label
               className={`file-picker ${filePending ? "pending" : ""}`}
@@ -1123,15 +1222,16 @@ function Messenger({
               <span aria-hidden="true">{filePending ? "…" : "+"}</span>
               <input
                 type="file"
+                accept="image/*"
+                multiple
                 disabled={
                   filePending ||
                   connection !== "online" ||
                   (conversation !== "polygon" && selectedUser === undefined)
                 }
                 onChange={(event) => {
-                  const file = event.target.files?.[0];
+                  addPhotoDrafts(event.target.files);
                   event.target.value = "";
-                  void selectChatFile(file);
                 }}
               />
             </label>
@@ -1150,8 +1250,9 @@ function Messenger({
             <button
               type="submit"
               disabled={
+                filePending ||
                 connection !== "online" ||
-                draft.trim().length === 0 ||
+                (draft.trim().length === 0 && photoDrafts.length === 0) ||
                 (conversation !== "polygon" && selectedUser === undefined)
               }
             >
@@ -1646,6 +1747,20 @@ function initials(name: string): string {
   return normalized.length === 0 ? "?" : normalized.slice(0, 2).toUpperCase();
 }
 
+function createDraftPhoto(file: File): DraftPhoto {
+  const randomUUID = globalThis.crypto?.randomUUID;
+  const id =
+    typeof randomUUID === "function"
+      ? randomUUID.call(globalThis.crypto)
+      : `${Date.now()}-${Math.random().toString(16).slice(2)}`;
+
+  return {
+    id,
+    file,
+    previewUrl: URL.createObjectURL(file),
+  };
+}
+
 function formatTime(value: string): string {
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return "";
@@ -1663,7 +1778,5 @@ function formatFileSize(value: number): string {
 }
 
 function isImageAttachment(attachment: FileAttachment): boolean {
-  return ["image/jpeg", "image/png", "image/webp", "image/gif"].includes(
-    attachment.content_type.toLowerCase(),
-  );
+  return attachment.content_type.toLowerCase().startsWith("image/");
 }
