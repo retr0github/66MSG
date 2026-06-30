@@ -15,6 +15,7 @@ import {
   loginWithTelegramCode,
   readSession,
   removeAvatar,
+  registerWithPassword,
   registerWithTelegramCode,
   requestPasswordResetCode,
   requestTelegramLoginCode,
@@ -30,6 +31,8 @@ import { type ScreenShareQuality, useVoiceChat } from "./voice";
 type Conversation = "polygon" | string;
 type AuthMode = "register" | "login" | "reset";
 type LoginMethod = "telegram" | "password";
+
+const telegramAuthEnabled = false;
 
 interface DraftPhoto {
   readonly id: string;
@@ -106,7 +109,7 @@ function AuthScreen({
   readonly onAuthenticated: (session: Session) => void;
 }) {
   const [mode, setMode] = useState<AuthMode>("register");
-  const [loginMethod, setLoginMethod] = useState<LoginMethod>("telegram");
+  const [loginMethod, setLoginMethod] = useState<LoginMethod>("password");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
   const [passwordConfirmation, setPasswordConfirmation] = useState("");
@@ -119,6 +122,8 @@ function AuthScreen({
   const [requestingCode, setRequestingCode] = useState(false);
 
   useEffect(() => {
+    if (!telegramAuthEnabled) return;
+
     fetchTelegramRegistrationInfo()
       .then(setTelegram)
       .catch((reason: unknown) => {
@@ -139,9 +144,7 @@ function AuthScreen({
         if (password !== passwordConfirmation) {
           throw new Error("Пароли не совпадают");
         }
-        onAuthenticated(
-          await registerWithTelegramCode(code, username, password),
-        );
+        onAuthenticated(await registerWithPassword(username, password));
       } else if (mode === "reset") {
         if (password !== passwordConfirmation) {
           throw new Error("Пароли не совпадают");
@@ -154,7 +157,7 @@ function AuthScreen({
         setPassword("");
         setPasswordConfirmation("");
         setNotice("Пароль изменён. Теперь можно войти с новым паролем.");
-      } else if (loginMethod === "telegram") {
+      } else if (telegramAuthEnabled && loginMethod === "telegram") {
         onAuthenticated(await loginWithTelegramCode(username, code));
       } else {
         onAuthenticated(await loginWithPassword(username, password));
@@ -262,14 +265,14 @@ function AuthScreen({
           </h1>
           <p>
             {mode === "register"
-              ? "Подтвердите Telegram, выберите ник и установите пароль."
+              ? "Выберите ник и установите пароль. Telegram временно не нужен."
               : mode === "reset"
                 ? "Получите код в привязанный Telegram и задайте новый пароль."
-                : "Войдите через Telegram-код или используйте ник и пароль."}
+                : "Введите ник и пароль, чтобы войти в 66MSG."}
           </p>
         </div>
 
-        {mode === "login" ? (
+        {telegramAuthEnabled && mode === "login" ? (
           <div className="auth-tabs login-methods" role="tablist">
             <button
               className={loginMethod === "telegram" ? "active" : ""}
@@ -297,7 +300,7 @@ function AuthScreen({
           </div>
         ) : null}
 
-        {mode === "register" ? (
+        {telegramAuthEnabled && mode === "register" ? (
           <div className="telegram-onboarding">
             <ol className="telegram-steps">
               <li>
@@ -349,7 +352,7 @@ function AuthScreen({
             <small>От 3 до 24 символов: буквы, цифры, _ и -</small>
           </label>
 
-          {mode === "login" && loginMethod === "telegram" ? (
+          {telegramAuthEnabled && mode === "login" && loginMethod === "telegram" ? (
             <div className="telegram-login-request">
               <p>
                 Нажмите кнопку — бот автоматически отправит код на Telegram,
@@ -373,7 +376,7 @@ function AuthScreen({
             </div>
           ) : null}
 
-          {mode === "reset" ? (
+          {telegramAuthEnabled && mode === "reset" ? (
             <div className="telegram-login-request">
               <p>
                 Бот отправит код в Telegram, привязанный к указанному аккаунту.
@@ -418,7 +421,7 @@ function AuthScreen({
             </label>
           ) : null}
 
-          {mode === "login" && loginMethod === "password" ? (
+          {telegramAuthEnabled && mode === "login" && loginMethod === "password" ? (
             <button
               className="forgot-password-button"
               type="button"
@@ -453,9 +456,9 @@ function AuthScreen({
             </label>
           ) : null}
 
-          {mode === "register" ||
-          (mode === "login" && loginMethod === "telegram" && codeRequested) ||
-          (mode === "reset" && codeRequested) ? (
+          {telegramAuthEnabled &&
+          ((mode === "login" && loginMethod === "telegram" && codeRequested) ||
+            (mode === "reset" && codeRequested)) ? (
             <label className="code-field">
               Код из Telegram
               <input
@@ -486,13 +489,12 @@ function AuthScreen({
             disabled={
               pending ||
               username.trim().length < 3 ||
+              (telegramAuthEnabled &&
+                ((mode === "login" && loginMethod === "telegram") ||
+                  mode === "reset") &&
+                (!codeRequested || code.length !== 6)) ||
               ((mode === "register" ||
-                (mode === "login" && loginMethod === "telegram") ||
-                mode === "reset") &&
-                ((mode !== "register" && !codeRequested) ||
-                  code.length !== 6)) ||
-              ((mode === "register" ||
-                (mode === "login" && loginMethod === "password") ||
+                mode === "login" ||
                 mode === "reset") &&
                 password.length < 8) ||
               ((mode === "register" || mode === "reset") &&

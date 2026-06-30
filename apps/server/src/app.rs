@@ -49,10 +49,10 @@ use crate::{
     error::AppError,
     models::{
         AuthResponse, ClientEvent, FileAttachment, HealthResponse, PasswordLoginRequest,
-        PasswordResetRequest, PolygonMessage, PrivateMessage, ServerEvent, ServiceStatus,
-        StoredData, StoredSession, StoredUser, TelegramCode, TelegramCodePurpose,
-        TelegramLoginCodeRequest, TelegramLoginCodeResponse, TelegramLoginRequest,
-        TelegramRegistrationInfo, TelegramRegistrationRequest, User,
+        PasswordRegistrationRequest, PasswordResetRequest, PolygonMessage, PrivateMessage,
+        ServerEvent, ServiceStatus, StoredData, StoredSession, StoredUser, TelegramCode,
+        TelegramCodePurpose, TelegramLoginCodeRequest, TelegramLoginCodeResponse,
+        TelegramLoginRequest, TelegramRegistrationInfo, TelegramRegistrationRequest, User,
     },
 };
 
@@ -62,6 +62,7 @@ const USERNAME_MIN: usize = 3;
 const USERNAME_MAX: usize = 24;
 const PASSWORD_MIN: usize = 8;
 const PASSWORD_MAX: usize = 128;
+const TELEGRAM_AUTH_ENABLED: bool = false;
 const MESSAGE_LIMIT: usize = 2_000;
 const AVATAR_SIZE_LIMIT: usize = 5 * 1024 * 1024;
 const FILE_SIZE_LIMIT: usize = 8 * 1024 * 1024;
@@ -523,15 +524,22 @@ pub fn build_router(config: &Config) -> Result<Router, AppError> {
     fs::create_dir_all(&avatars_dir)?;
     fs::create_dir_all(&files_dir)?;
 
-    if let Some(bot) = telegram_bot {
-        tokio::spawn(run_telegram_bot(state.clone(), bot));
+    if TELEGRAM_AUTH_ENABLED {
+        if let Some(bot) = telegram_bot {
+            tokio::spawn(run_telegram_bot(state.clone(), bot));
+        } else {
+            warn!("TELEGRAM_BOT_TOKEN is not set; Telegram bot polling is disabled");
+        }
+    } else if telegram_bot.is_some() {
+        warn!("Telegram auth is temporarily disabled; Telegram bot polling is not started");
     } else {
-        warn!("TELEGRAM_BOT_TOKEN is not set; Telegram bot polling is disabled");
+        warn!("Telegram auth is temporarily disabled");
     }
 
     Ok(Router::new()
         .route("/health", get(health))
         .route("/auth/telegram", get(telegram_registration_info))
+        .route("/auth/register/password", post(register_with_password))
         .route(
             "/auth/register/telegram-code",
             post(register_with_telegram_code),
@@ -583,18 +591,29 @@ async fn health() -> Json<HealthResponse> {
     })
 }
 
+fn ensure_telegram_auth_enabled() -> Result<(), ApiError> {
+    if TELEGRAM_AUTH_ENABLED {
+        Ok(())
+    } else {
+        Err(ApiError::bad_request(
+            "Telegram-авторизация временно отключена",
+        ))
+    }
+}
+
 async fn telegram_registration_info(
     State(state): State<AppState>,
-) -> Json<TelegramRegistrationInfo> {
+) -> Result<Json<TelegramRegistrationInfo>, ApiError> {
+    ensure_telegram_auth_enabled()?;
     let bot_url = state
         .telegram_bot_username
         .as_ref()
         .map(|username| format!("https://t.me/{username}"));
-    Json(TelegramRegistrationInfo {
+    Ok(Json(TelegramRegistrationInfo {
         bot_username: state.telegram_bot_username.clone(),
         bot_url,
         code_ttl_seconds: TELEGRAM_CODE_TTL_MINUTES * 60,
-    })
+    }))
 }
 
 async fn livekit_token(
@@ -972,11 +991,59 @@ fn update_user_avatar(
     Ok(user)
 }
 
+async fn register_with_password(
+    State(state): State<AppState>,
+    ConnectInfo(address): ConnectInfo<SocketAddr>,
+    Json(request): Json<PasswordRegistrationRequest>,
+) -> Result<Json<AuthResponse>, ApiError> {
+    state.check_registration_rate(address.ip())?;
+
+    let username = validate_username(&request.username)?;
+    validate_password(&request.password)?;
+    let password_hash = hash_password(&request.password)?;
+    let now = Utc::now();
+
+    let user = {
+        let mut data = state.data()?;
+        let mut updated = data.clone();
+        if username_exists(&updated, &username) {
+            return Err(ApiError::username_taken());
+        }
+
+        let user = User {
+            id: Uuid::new_v4(),
+            username,
+            emoji: None,
+            avatar_url: None,
+            telegram_username: None,
+            telegram_first_name: None,
+            telegram_last_name: None,
+            created_at: now,
+        };
+        updated.users.push(StoredUser {
+            user: user.clone(),
+            telegram_id: None,
+            password_hash: Some(password_hash),
+        });
+
+        state.persist(&updated)?;
+        *data = updated;
+        user
+    };
+
+    let (token, _session_id) = state.create_session(user.id)?;
+    let _receiver_count = state
+        .events
+        .send(ServerEvent::UserRegistered { user: user.clone() });
+    Ok(Json(AuthResponse { token, user }))
+}
+
 async fn register_with_telegram_code(
     State(state): State<AppState>,
     ConnectInfo(address): ConnectInfo<SocketAddr>,
     Json(request): Json<TelegramRegistrationRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
+    ensure_telegram_auth_enabled()?;
     state.check_registration_rate(address.ip())?;
 
     let code = request.code.trim();
@@ -1109,6 +1176,7 @@ async fn request_telegram_login_code(
     ConnectInfo(address): ConnectInfo<SocketAddr>,
     Json(request): Json<TelegramLoginCodeRequest>,
 ) -> Result<Json<TelegramLoginCodeResponse>, ApiError> {
+    ensure_telegram_auth_enabled()?;
     state.check_registration_rate(address.ip())?;
     let stored = state
         .data()?
@@ -1161,6 +1229,7 @@ async fn login_with_telegram_code(
     ConnectInfo(address): ConnectInfo<SocketAddr>,
     Json(request): Json<TelegramLoginRequest>,
 ) -> Result<Json<AuthResponse>, ApiError> {
+    ensure_telegram_auth_enabled()?;
     state.check_registration_rate(address.ip())?;
     let username = request.username.trim();
     let code = request.code.trim();
@@ -1222,6 +1291,7 @@ async fn request_password_reset_code(
     ConnectInfo(address): ConnectInfo<SocketAddr>,
     Json(request): Json<TelegramLoginCodeRequest>,
 ) -> Result<Json<TelegramLoginCodeResponse>, ApiError> {
+    ensure_telegram_auth_enabled()?;
     state.check_registration_rate(address.ip())?;
     let stored = state
         .data()?
@@ -1278,6 +1348,7 @@ async fn reset_password(
     ConnectInfo(address): ConnectInfo<SocketAddr>,
     Json(request): Json<PasswordResetRequest>,
 ) -> Result<StatusCode, ApiError> {
+    ensure_telegram_auth_enabled()?;
     state.check_registration_rate(address.ip())?;
     let username = request.username.trim();
     let code = request.code.trim();
@@ -1597,6 +1668,10 @@ fn event_is_visible(event: &ServerEvent, user_id: Uuid) -> bool {
 }
 
 async fn notify_login(state: &AppState, user: &User, session_id: Uuid) {
+    if !TELEGRAM_AUTH_ENABLED {
+        return;
+    }
+
     let Some(bot) = state.telegram_bot.clone() else {
         return;
     };

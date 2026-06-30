@@ -125,6 +125,12 @@ pub struct TelegramRegistrationRequest {
 }
 
 #[derive(Debug, Deserialize)]
+pub struct PasswordRegistrationRequest {
+    pub username: String,
+    pub password: String,
+}
+
+#[derive(Debug, Deserialize)]
 pub struct PasswordLoginRequest {
     pub username: String,
     pub password: String,

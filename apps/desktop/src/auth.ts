@@ -34,6 +34,13 @@ export async function registerWithTelegramCode(
   });
 }
 
+export async function registerWithPassword(
+  username: string,
+  password: string,
+): Promise<Session> {
+  return authRequest("/auth/register/password", { username, password });
+}
+
 export async function loginWithPassword(
   username: string,
   password: string,
